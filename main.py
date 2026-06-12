@@ -1,104 +1,152 @@
 import cv2
 import numpy as np
 import os
+from pathlib import Path
+from rembg import remove, new_session
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import threading
+import time
 
-INPUT_FOLDER = "input_images"
-OUTPUT_FOLDER = "output_images"
+# Automatically locate the user's system Downloads folder
+DOWNLOADS_FOLDER = str(Path.home() / "Downloads")
+OUTPUT_FOLDER = os.path.join(DOWNLOADS_FOLDER, "output_images")
 BACKGROUND_COLOR = (255, 255, 255) # White background (BGR format)
-PADDING_RATIO = 0.15                # 15% of the largest item dimension used as padding
-MIN_AREA_THRESHOLD = 500            # Ignore contours smaller than this pixel area
 
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+# Initialize the AI session once
+ai_session = new_session("u2net")
 
-def process_multi_item_image(image, base_filename):
-    h_img, w_img = image.shape[:2]
+# Global variables for tracking state
+start_time = 0.0
+is_processing = False
 
-    # Convert to grayscale and blur
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+def process_image_ai_only(image, base_filename):
+    """
+    Passes the image directly to the AI model for background removal
+    and replaces the background with solid white.
+    """
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    
+    # 1. Convert BGR to RGB
+    rgb_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # Otsu threshold to separate objects from background
-    _, thresh = cv2.threshold(
-        blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
+    # 2. Run AI background removal
+    rgba_out = remove(rgb_img, session=ai_session)
 
-    # Find external contours
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    # 3. Extract the Alpha mask
+    alpha_mask = rgba_out[:, :, 3]
 
-    item_count = 0
+    # 4. Create a solid white background
+    white_bg = np.full(image.shape, BACKGROUND_COLOR, dtype=np.uint8)
 
-    for i, contour in enumerate(contours):
-        # 1. Skip tiny noise contours
-        if cv2.contourArea(contour) < MIN_AREA_THRESHOLD:
-            continue
+    # 5. Blend original image onto white background using the AI mask
+    mask_normalized = alpha_mask[:, :, None] / 255.0
+    bg_removed_image = (image * mask_normalized + white_bg * (1.0 - mask_normalized)).astype(np.uint8)
+
+    # 6. Save the output to Downloads/output_images
+    output_path = os.path.join(OUTPUT_FOLDER, base_filename)
+    cv2.imwrite(output_path, bg_removed_image)
+
+def update_stopwatch():
+    """
+    Background loop that updates the stopwatch label every 100ms.
+    """
+    if is_processing:
+        elapsed = time.time() - start_time
+        timer_label.config(text=f"Time Elapsed: {elapsed:.1f}s")
+        root.after(100, update_stopwatch)
+
+def background_processing(input_folder, files_to_process):
+    """
+    Handles image processing on a separate thread to keep UI elements moving.
+    """
+    global is_processing, start_time
+    
+    success_count = 0
+    total_files = len(files_to_process)
+    
+    # Initialize UI indicators and start timing
+    start_time = time.time()
+    is_processing = True
+    update_stopwatch()
+    
+    progress_bar["maximum"] = total_files
+    progress_bar["value"] = 0
+    
+    for idx, filename in enumerate(files_to_process, start=1):
+        status_label.config(text=f"Processing image {idx} of {total_files}...")
+        
+        path = os.path.join(input_folder, filename)
+        image = cv2.imread(path)
+        
+        if image is not None:
+            process_image_ai_only(image, filename)
+            success_count += 1
             
-        item_count += 1
-        x, y, w, h = cv2.boundingRect(contour)
+        progress_bar["value"] = idx
 
-        # 2. Create an isolated mask for JUST this specific item
-        item_mask = np.zeros_like(thresh)
-        cv2.drawContours(item_mask, [contour], -1, 255, thickness=cv2.FILLED)
+    # Stop timing operations
+    is_processing = False
+    total_elapsed = time.time() - start_time
+    
+    # Finalise UI presentation
+    status_label.config(text="Done!")
+    timer_label.config(text=f"Total Time: {total_elapsed:.1f}s")
+    upload_btn.config(state=tk.NORMAL)
+    
+    messagebox.showinfo("Success", f"Processed {success_count} images successfully in {total_elapsed:.1f} seconds!\nSaved to: {OUTPUT_FOLDER}")
 
-        # 3. Apply mask to remove background specifically for this item
-        white_bg = np.full(image.shape, BACKGROUND_COLOR, dtype=np.uint8)
-        bg_removed_image = np.where(item_mask[:, :, None] == 255, image, white_bg)
-
-        # 4. Calculate dynamic padding
-        item_largest_dim = max(w, h)
-        padding = int(item_largest_dim * PADDING_RATIO)
+def select_and_process_folder():
+    """
+    Opens a dialog box for the user to select an entire folder,
+    then automatically starts background processing.
+    """
+    input_folder = filedialog.askdirectory(title="Select Folder Containing Images")
+    if not input_folder:
+        return 
         
-        padded_w = w + (padding * 2)
-        padded_h = h + (padding * 2)
-        square_size = max(padded_w, padded_h)
-        
-        # Center the square crop over the item center
-        center_x = x + w // 2
-        center_y = y + h // 2
-        
-        x_min = center_x - square_size // 2
-        y_min = center_y - square_size // 2
-        x_max = x_min + square_size
-        y_max = y_min + square_size
-
-        # 5. Canvas extraction (handles items near or touching image borders)
-        canvas = np.full((square_size, square_size, 3), BACKGROUND_COLOR, dtype=np.uint8)
-        
-        src_x_min = max(x_min, 0)
-        src_y_min = max(y_min, 0)
-        src_x_max = min(x_max, w_img)
-        src_y_max = min(y_max, h_img)
-        
-        dst_x_min = src_x_min - x_min
-        dst_y_min = src_y_min - y_min
-        dst_x_max = dst_x_min + (src_x_max - src_x_min)
-        dst_y_max = dst_y_min + (src_y_max - src_y_min)
-        
-        canvas[dst_y_min:dst_y_max, dst_x_min:dst_x_max] = bg_removed_image[src_y_min:src_y_max, src_x_min:src_x_max]
-
-        # 6. Save the isolated item with a unique suffix
-        name, ext = os.path.splitext(base_filename)
-        output_filename = f"{name}_item{item_count}{ext}"
-        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
-        cv2.imwrite(output_path, canvas)
-        
-    print(f" -> Extracted {item_count} items from {base_filename}")
-
-
-def process_folder():
     valid_extensions = (".jpg", ".jpeg", ".png")
     
-    for filename in os.listdir(INPUT_FOLDER):
-        if filename.lower().endswith(valid_extensions):
-            path = os.path.join(INPUT_FOLDER, filename)
+    files_to_process = [
+        f for f in os.listdir(input_folder) 
+        if f.lower().endswith(valid_extensions)
+    ]
+    
+    if not files_to_process:
+        messagebox.showwarning("No Images Found", "No valid .jpg, .jpeg, or .png images were found in that folder.")
+        return
 
-            image = cv2.imread(path)
-            if image is None:
-                continue
+    # Disable button to prevent multi-clicking while running
+    upload_btn.config(state=tk.DISABLED)
+    
+    # Spawn background thread to prevent GUI lockup
+    threading.Thread(target=background_processing, args=(input_folder, files_to_process), daemon=True).start()
 
-            print(f"Processing: {filename}")
-            process_multi_item_image(image, filename)
+# --- Create the GUI window ---
+root = tk.Tk()
+root.title("AI Background Remover")
+root.geometry("450x300")
+root.resizable(False, False)
+
+# Instruction Label
+instruction_label = tk.Label(root, text="Select a folder to remove backgrounds from all images.\nOutputs will save to your Downloads folder.", font=("Arial", 11), pady=15)
+instruction_label.pack()
+
+# Upload Folder Button
+upload_btn = tk.Button(root, text="Select Folder", command=select_and_process_folder, font=("Arial", 12, "bold"), bg="#4CAF50", fg="white", padx=10, pady=5)
+upload_btn.pack()
+
+# Status Label
+status_label = tk.Label(root, text="Ready", font=("Arial", 10, "italic"), pady=10, fg="blue")
+status_label.pack()
+
+# Progress Bar
+progress_bar = ttk.Progressbar(root, orient="horizontal", length=350, mode="determinate")
+progress_bar.pack(pady=5)
+
+# Stopwatch/Timer Label
+timer_label = tk.Label(root, text="Time Elapsed: 0.0s", font=("Arial", 10, "bold"), fg="#333333", pady=5)
+timer_label.pack()
 
 if __name__ == "__main__":
-    process_folder()
+    root.mainloop()
