@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
 import time
+from PIL import Image, ImageOps  # Added for EXIF orientation handling
 
 # Automatically locate the user's system Downloads folder
 DOWNLOADS_FOLDER = str(Path.home() / "Downloads")
@@ -77,7 +78,16 @@ def background_processing(input_folder, files_to_process):
         status_label.config(text=f"Processing image {idx} of {total_files}...")
         
         path = os.path.join(input_folder, filename)
-        image = cv2.imread(path)
+        
+        try:
+            # 1. Open image with PIL to read EXIF metadata
+            with Image.open(path) as img:
+                # 2. Rotate/flip image based on the EXIF orientation tag automatically
+                img = ImageOps.exif_transpose(img)
+                # 3. Convert PIL RGB format to OpenCV BGR format array
+                image = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            image = None
         
         if image is not None:
             process_image_ai_only(image, filename)
